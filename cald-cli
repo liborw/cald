@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+""" Command line interface to evidence.cald.cz
+
+Usage:
+    cald-cli [options] (--auth AUTH) update <teamdesc>
+    cald-cli [options] (--auth AUTH) dumpteam <teamname>
+    cald-cli [options] (--auth AUTH) player (<first_name> <last_name> | <id>)
+    cald-cli [options] (--auth AUTH) list <type> <query>
+    cald-cli -h | --help
+
+Options:
+    -h, --help
+    -d, --debug
+    -a AUTH, --auth AUTH            Authorisation user:pass.
+    --year YEAR                     First year
+    --insert
+    --url URL                       Cald web url [default: http://cald.yosarin.net] 
+"""
+
+from cald import CaldApi
+from docopt import docopt
+import json
+import logging
+import datetime
+
+
+def main():
+
+    user, password = opt['--auth'].split(':')
+
+    api = CaldApi(opt['--url'])
+    api.authorize(user, password)
+
+    if opt['update']:
+        cmd_update(api)
+
+    if opt['dumpteam']:
+        cmd_dumpteam(api)
+
+    if opt['player']:
+        cmd_player(api)
+
+    if opt['list']:
+        cmd_list(api)
+
+
+def cmd_list(api):
+
+    query = json.loads('{'opt['<query>'])
+    ret, data = api.list(opt['<type>'])
+
+def cmd_update(api):
+
+    # get season id
+    year = datetime.datetime.now().year
+    if opt['--year'] is not None:
+        year = int(opt['--year'])
+    seasonid = api.get_season_id(year)
+    log.info('New players will be added from the year %d (%d)', year, seasonid)
+
+    # load data
+    with open(opt['<teamdesc>'], 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # update teamd
+    ret, dbteam = api.get_team(name=data['team']['name'])
+    if ret and len(dbteam) == 1:
+        teamid = int(dbteam[0]['id'])
+        api.update_team(data['team'], teamid)
+    else:
+        log.error('No team found')
+        return
+
+    # update players
+    for player in data['players']:
+        log.info('Processing player %s %s',
+                 player['first_name'],
+                 player['last_name'])
+
+        if 'nationality_id' not in player:
+            player['nationality_id'] = 0
+
+        pid = player.get('id', None)
+        ret, dbplayer = api.get_player(first_name=player['first_name'],
+                                       last_name=player['last_name'])
+        if ret and len(dbplayer) == 0:
+            pid = int(dbplayer[-1]['id'])
+            log.debug('Got id from db: %d', pid)
+        if pid is not None:
+            ret, data = api.update_player(player, pid)
+            if ret:
+                log.info('Player update')
+            else:
+                log.warning('Unable to update: %s', str(data['error']))
+        elif opt['--insert']:
+            ret, data = api.new_player(player)
+            if ret:
+                log.debug('Player created')
+                pid = data
+                ret, tpdata = api.add_team_player(teamid, pid, seasonid)
+                if ret:
+                    log.debug('Added to team')
+                else:
+                    log.warning('Unable to add player to team: %s',
+                                str(data['error']))
+            else:
+                log.warn('Unable create player: %s', str(data['error']))
+                continue
+        else:
+            log.info('Skipping, set --insert if you want to add new player')
+            continue
+
+        # update address
+        upsert_address(api, player['address'], pid)
+
+def cmd_dumpteam(api):
+    data = dict()
+
+    # get team
+    ret, dbteam = api.get_team(name=opt['<teamname>'])
+    if ret and dbteam:
+        teamid = int(dbteam[0]['id'])
+        data['team'] = dbteam[0]
+        log.debug('Team id: %d', teamid)
+    else:
+        log.warning('No team %s found', opt['<teamname>'])
+        return
+
+    # get players
+    ret, players = api.list('player_at_team', where={'team_id': teamid})
+    if ret and players:
+        data['players'] = players
+
+    print(json.dumps(data, indent=4, separators=(',', ': '), ensure_ascii=False))
+
+
+def cmd_player(api):
+    if opt['<id>'] is not None:
+        query = {'id': opt['<id>']}
+        ret, data = api.get_player(**query)
+    else:
+        query = {'first_name': opt['<first_name>'],
+                 'last_name': opt['<last_name>']}
+        ret, data = api.get_player(**query)
+
+    if ret:
+        print('Player:')
+        print(json.dumps(data, indent=4,
+                         separators=(',', ': '),
+                         ensure_ascii=False))
+    else:
+        print(ret, data)
+        return
+
+    pid = int(data[0]['id'])
+    ret, data = api.get_player_address(pid)
+    if ret:
+        print('Address: ')
+        print(json.dumps(data, indent=4,
+                         separators=(',', ': '),
+                         ensure_ascii=False))
+
+    ret, data = api.list('player_at_team', where={'player_id': pid}, extend=1)
+    if ret:
+        print('Team: ')
+        print(json.dumps(data, indent=4,
+                         separators=(',', ': '),
+                         ensure_ascii=False))
+
+
+def upsert_player(api, player):
+    # get user id
+    pid = player.get('id', None)
+    ret, dbplayer = api.get_player(first_name=player['first_name'],
+                                   last_name=player['last_name'])
+    if ret and len(dbplayer) == 1:
+        pid = int(dbplayer[0]['id'])
+        log.debug('Got id from db: %d', pid)
+    if pid is not None:
+        ret, data = api.update_player(player, pid)
+    elif opt['--insert']:
+        ret, data = api.new_player(player)
+
+
+        
+    if ret:
+        return True
+    else:
+        log.warn('Problem updating/adding address: %s', data['error'])
+        return False
+
+
+
+
+def upsert_address(api, address, pid):
+    aid = api.get_player_address_id(pid)
+
+    if aid:
+        ret, data = api.update_player_address(address, pid, aid)
+    else:
+        ret, data = api.add_player_address(address, pid)
+
+    if ret:
+        return True
+    else:
+        log.warn('Problem updating/adding address: %s', data['error'])
+        return False
+
+
+if __name__ == "__main__":
+    opt = docopt(__doc__)
+    log = logging.getLogger('cald-cli')
+    logging.basicConfig(level='DEBUG' if opt['--debug'] else 'INFO')
+    main()
+
+
+
